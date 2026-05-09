@@ -2,6 +2,8 @@
  * BunMoji Sidecar Evaluation
  * Single sidecar call that evaluates conditionals + picks expression/background.
  * Conditionals override labels: if any pass, the model picks ONLY from those.
+ *
+ * Modified: Group chat support (per-character sidecar calls) + expression tool toggle.
  */
 
 import { getContext } from '../../../st-context.js';
@@ -20,9 +22,10 @@ import { setSidecarActive, addFeedItem } from './activity-feed.js';
 
 /**
  * Run the sidecar — single call handles conditionals + selection.
+ * @param {string} [charName] - Character name to evaluate for (required in group chats, optional in solo)
  * @returns {Promise<SidecarResult>}
  */
-export async function runSidecar() {
+export async function runSidecar(charName) {
     const settings = getSettings();
 
     if (!isSidecarConfigured()) {
@@ -31,6 +34,7 @@ export async function runSidecar() {
     }
 
     const context = getContext();
+    const resolvedCharName = charName || context.name2 || 'the character';
     const msgCount = settings.contextMessages || 10;
     const recentMessages = (context.chat || [])
         .filter(m => m.mes && !m.is_system)
@@ -40,30 +44,41 @@ export async function runSidecar() {
 
     if (!recentMessages) return { expression: null, background: null };
 
-    // Gather all options
-    const disabledConds = new Set(settings.disabledConditionals || []);
-    const conditionalSprites = (settings.conditionalSprites || []).filter(cs => !disabledConds.has(cs.label));
-    const conditionalBgs = settings.conditionalBackgrounds || [];
-    const spriteLabels = await getAvailableLabels();
-    const bgFilenames = settings.bgToolEnabled ? await fetchBackgroundsList() : [];
+    // Determine what tools to offer
+    const expressionsEnabled = settings.expressionToolEnabled;
+    const bgEnabled = settings.bgToolEnabled;
 
+    // Gather expression options (only if expression tool is enabled)
+    const disabledConds = new Set(settings.disabledConditionals || []);
+    const conditionalSprites = expressionsEnabled
+        ? (settings.conditionalSprites || []).filter(cs => !disabledConds.has(cs.label))
+        : [];
+    const conditionalBgs = settings.conditionalBackgrounds || [];
+    const spriteLabels = expressionsEnabled ? await getAvailableLabels(charName) : [];
+    const bgFilenames = bgEnabled ? await fetchBackgroundsList() : [];
+
+    // Nothing to do?
     if (spriteLabels.length === 0 && conditionalSprites.length === 0 && bgFilenames.length === 0) {
         return { expression: null, background: null };
     }
 
     // Build ALL possible labels (labels + conditional labels) for the tool enum
     const conditionalSpriteLabels = conditionalSprites.map(cs => getDisplayLabel(cs.label));
-    const allSpriteOptions = [...new Set([...spriteLabels, ...conditionalSpriteLabels])].sort();
+    const allSpriteOptions = expressionsEnabled
+        ? [...new Set([...spriteLabels, ...conditionalSpriteLabels])].sort()
+        : [];
     const conditionalBgFilenames = conditionalBgs.map(cb => cb.filename);
     const allBgOptions = [...new Set([...bgFilenames, ...conditionalBgFilenames])].sort();
 
     setSidecarActive(true);
 
     try {
-        const charName = context.name2 || 'the character';
-
         // Build tools with ALL options in enum
-        const tools = buildSelectionTools(allSpriteOptions, allBgOptions, settings.bgToolEnabled, charName);
+        const tools = buildSelectionTools(allSpriteOptions, allBgOptions, bgEnabled, resolvedCharName);
+
+        if (tools.length === 0) {
+            return { expression: null, background: null };
+        }
 
         // Get current state for context (if setting enabled)
         let currentExpression = null;
@@ -71,7 +86,7 @@ export async function runSidecar() {
         if (settings.showCurrentState) {
             const recentWithExpr = [...(context.chat || [])].reverse().find(m => m.extra?.bunmoji_expression);
             const recentWithBg = [...(context.chat || [])].reverse().find(m => m.extra?.bunmoji_background);
-            currentExpression = recentWithExpr?.extra?.bunmoji_expression || null;
+            currentExpression = expressionsEnabled ? (recentWithExpr?.extra?.bunmoji_expression || null) : null;
             currentBackground = recentWithBg?.extra?.bunmoji_background || null;
         }
         const prompt = buildUnifiedPrompt({
@@ -80,13 +95,22 @@ export async function runSidecar() {
             conditionalSprites,
             conditionalBgs,
             bgFilenames,
-            bgEnabled: settings.bgToolEnabled,
+            bgEnabled,
+            expressionsEnabled,
             currentExpression,
             currentBackground,
-            charName,
+            charName: resolvedCharName,
         });
 
-        const systemPrompt = `You are a visual director for a roleplay scene. Pick the expression for ${charName} (the AI character, NOT the user). Keep reasoning to 1-2 sentences. You MUST call your assigned tools.`;
+        // Adjust system prompt based on what tools are available
+        let systemPrompt;
+        if (expressionsEnabled && bgEnabled) {
+            systemPrompt = `You are a visual director for a roleplay scene. Pick the expression for ${resolvedCharName} (the AI character, NOT the user) and the scene background. Keep reasoning to 1-2 sentences. You MUST call your assigned tools.`;
+        } else if (expressionsEnabled) {
+            systemPrompt = `You are a visual director for a roleplay scene. Pick the expression for ${resolvedCharName} (the AI character, NOT the user). Keep reasoning to 1-2 sentences. You MUST call your assigned tools.`;
+        } else {
+            systemPrompt = `You are a visual director for a roleplay scene. Pick the scene background based on the current location and atmosphere. Keep reasoning to 1-2 sentences. You MUST call your assigned tools.`;
+        }
 
         let result = { expression: null, background: null, expressionReasoning: null, backgroundReasoning: null };
 
@@ -94,7 +118,7 @@ export async function runSidecar() {
             const { toolCalls, textContent } = await sidecarGenerateWithTools({ prompt, systemPrompt, tools });
 
             for (const tc of toolCalls) {
-                if (tc.name === 'set_expression') {
+                if (tc.name === 'set_expression' && expressionsEnabled) {
                     const expr = String(tc.args?.expression || '').toLowerCase().trim();
                     if (expr && allSpriteOptions.includes(expr)) {
                         result.expression = expr;
@@ -114,9 +138,9 @@ export async function runSidecar() {
             }
 
             // Text fallback if tool calls empty
-            if (!result.expression && textContent) {
+            if (toolCalls.length === 0 && textContent) {
                 const parsed = parseResponse(textContent, allSpriteOptions, allBgOptions);
-                if (parsed.expression) result.expression = parsed.expression;
+                if (expressionsEnabled && parsed.expression) result.expression = parsed.expression;
                 if (!result.background && parsed.background) result.background = parsed.background;
             }
         } catch (e) {
@@ -126,36 +150,39 @@ export async function runSidecar() {
             try {
                 const fallbackPrompt = buildUnifiedPrompt({
                     recentMessages, spriteLabels, conditionalSprites, conditionalBgs,
-                    bgFilenames, bgEnabled: settings.bgToolEnabled, jsonMode: true,
+                    bgFilenames, bgEnabled, expressionsEnabled, jsonMode: true,
+                    charName: resolvedCharName,
                 });
                 const response = await sidecarGenerate({ prompt: fallbackPrompt, systemPrompt: 'Respond ONLY with valid JSON.' });
                 result = parseResponse(response, allSpriteOptions, allBgOptions);
+                // Strip expression if expressions disabled
+                if (!expressionsEnabled) result.expression = null;
             } catch (e2) {
                 console.error('[BunMoji] Text fallback also failed:', e2);
                 addFeedItem({ type: 'error', label: e2.message || 'Sidecar fallback failed' });
             }
         }
 
-        // Save to the user message that triggered this generation (it exists right now)
+        // Save to the user message that triggered this generation
         if (result.expression) saveToMetadata('bunmoji_expression', result.expression);
         if (result.background) saveToMetadata('bunmoji_background', result.background);
 
-        if (result.expression) {
-            await restoreExpression(result.expression);
+        if (result.expression && expressionsEnabled) {
+            await restoreExpression(result.expression, charName);
             // Set ST's fallback expression to our pick so moduleWorker doesn't overwrite us
             if (extension_settings.expressions) {
                 extension_settings.expressions.fallback_expression = resolveFileLabel(result.expression);
             }
             const isConditionalPick = conditionalSpriteLabels.includes(result.expression);
-            console.log(`[BunMoji] Sidecar set expression: ${result.expression}${isConditionalPick ? ' (conditional)' : ''}`);
+            console.log(`[BunMoji] Sidecar set expression for ${resolvedCharName}: ${result.expression}${isConditionalPick ? ' (conditional)' : ''}`);
             addFeedItem({
                 type: isConditionalPick ? 'conditional' : 'expression',
-                label: result.expression,
+                label: `${resolvedCharName}: ${result.expression}`,
                 reasoning: result.expressionReasoning,
             });
         }
 
-        if (result.background && settings.bgToolEnabled) {
+        if (result.background && bgEnabled) {
             await applyBackground(result.background);
             console.log(`[BunMoji] Sidecar set background: ${result.background}`);
             addFeedItem({ type: 'background', label: result.background, reasoning: result.backgroundReasoning });
@@ -175,11 +202,13 @@ export async function runSidecar() {
 
 /**
  * Build a single prompt that handles conditionals + selection.
- * The model evaluates conditions internally and picks accordingly.
  */
-function buildUnifiedPrompt({ recentMessages, spriteLabels, conditionalSprites, conditionalBgs, bgFilenames, bgEnabled, jsonMode = false, currentExpression = null, currentBackground = null, charName = 'the character' }) {
+function buildUnifiedPrompt({ recentMessages, spriteLabels, conditionalSprites, conditionalBgs, bgFilenames, bgEnabled, expressionsEnabled = true, jsonMode = false, currentExpression = null, currentBackground = null, charName = 'the character' }) {
     let prompt = 'Current scene:\n' + recentMessages + '\n\n';
-    prompt += `You are picking the expression for **${charName}** (the AI character). NOT the user.\n\n`;
+
+    if (expressionsEnabled) {
+        prompt += `You are picking the expression for **${charName}** (the AI character). NOT the user.\n\n`;
+    }
 
     // Show current state if available
     if (currentExpression || currentBackground) {
@@ -189,15 +218,15 @@ function buildUnifiedPrompt({ recentMessages, spriteLabels, conditionalSprites, 
         prompt += '\nOnly change if the character\'s emotional state or scene location has meaningfully shifted.\n\n';
     }
 
-    const hasCondSprites = conditionalSprites.length > 0;
+    const hasCondSprites = expressionsEnabled && conditionalSprites.length > 0;
     const hasCondBgs = conditionalBgs.length > 0;
 
-    // Label expressions
-    if (spriteLabels.length > 0) {
+    // Label expressions (only if expressions enabled)
+    if (expressionsEnabled && spriteLabels.length > 0) {
         prompt += `Label expressions (always available): ${spriteLabels.join(', ')}\n\n`;
     }
 
-    // Conditional expressions with their condition groups
+    // Conditional expressions with their condition groups (only if expressions enabled)
     if (hasCondSprites) {
         prompt += 'Conditional expressions (available ONLY if their conditions are met):\n';
         prompt += 'Condition types:\n';
@@ -225,7 +254,7 @@ function buildUnifiedPrompt({ recentMessages, spriteLabels, conditionalSprites, 
         prompt += '\n';
     }
 
-    // Priority rules
+    // Priority rules (only if expressions enabled)
     if (hasCondSprites) {
         prompt += 'RULES for conditional expressions:\n';
         prompt += '1. For each conditional, evaluate its condition groups. A group passes when ALL its conditions are met.\n';
@@ -261,17 +290,24 @@ function buildUnifiedPrompt({ recentMessages, spriteLabels, conditionalSprites, 
     // JSON mode instructions (text fallback)
     if (jsonMode) {
         prompt += 'Respond with JSON:\n{\n';
-        prompt += '  "expression": "chosen_label",\n';
-        prompt += '  "reasoning": "1-2 sentence reason"';
+        if (expressionsEnabled) {
+            prompt += '  "expression": "chosen_label",\n';
+            prompt += '  "reasoning": "1-2 sentence reason"';
+        }
         if (bgEnabled && bgFilenames.length > 0) {
-            prompt += ',\n  "background": "chosen_filename",\n';
+            if (expressionsEnabled) prompt += ',\n';
+            prompt += '  "background": "chosen_filename",\n';
             prompt += '  "bg_reasoning": "1-2 sentence reason"';
         }
         prompt += '\n}\n';
     } else {
-        prompt += 'Pick the best expression';
-        if (bgEnabled && bgFilenames.length > 0) prompt += ' and background';
-        prompt += ' for this scene. Keep reasoning to 1-2 sentences.';
+        if (expressionsEnabled && bgEnabled && bgFilenames.length > 0) {
+            prompt += `Pick the best expression for ${charName} and background for this scene. Keep reasoning to 1-2 sentences.`;
+        } else if (expressionsEnabled) {
+            prompt += `Pick the best expression for ${charName} for this scene. Keep reasoning to 1-2 sentences.`;
+        } else if (bgEnabled && bgFilenames.length > 0) {
+            prompt += 'Pick the best background for this scene. Keep reasoning to 1-2 sentences.';
+        }
     }
 
     return prompt;
