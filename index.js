@@ -15,7 +15,6 @@ import { SlashCommandEnumValue, enumTypes } from '../../../slash-commands/SlashC
 import { runDiagnostics } from './diagnostics.js';
 import { runSidecar } from './sidecar-eval.js';
 import { initActivityFeed } from './activity-feed.js';
-// llm-sidecar.js is used by sidecar-eval.js and diagnostics.js directly
 import { EVALUABLE_TYPES, CONDITION_LABELS } from './conditions.js';
 
 const EXTENSION_NAME = 'bunmoji';
@@ -25,12 +24,11 @@ const MODULE_NAME = 'BunMoji';
 let _savedExpressionApi = null;
 let _slashCommandCooldown = 0;
 /**
- * Track which character the sidecar already ran for this turn.
- * In solo chats: set to the single character name after running.
- * In group chats: set per-character, reset when a new user message arrives.
+ * Track which characters the sidecar already ran for this turn.
+ * In solo chats: behaves like the original boolean (one entry).
+ * In group chats: tracks per-character so each member gets evaluated.
  */
 let _sidecarRanForChars = new Set();
-let _lastUserMessageId = -1;
 let _pendingSidecarExpression = null;
 let _pendingSidecarBackground = null;
 
@@ -38,7 +36,7 @@ let _pendingSidecarBackground = null;
 
 const SETTING_DEFAULTS = {
     enabled: false,
-    expressionToolEnabled: true, // NEW: toggle expressions separately from backgrounds
+    expressionToolEnabled: true,
     conditionalSprites: [],
     connectionProfile: null,
     sidecarTemperature: 0.2,
@@ -51,7 +49,7 @@ const SETTING_DEFAULTS = {
     disabledConditionals: [],
     showCurrentState: true,
     contextMessages: 10,
-    evalTiming: 'before',  // 'before' or 'after'
+    evalTiming: 'before',
 };
 
 function ensureSettings() {
@@ -67,7 +65,6 @@ function ensureSettings() {
         }
     }
 
-    // Migrate old conditions[] + logic format to conditionGroups[][]
     for (const cs of (s.conditionalSprites || [])) {
         if (cs.conditions && !cs.conditionGroups) {
             cs.conditionGroups = cs.conditions.length > 0 ? [cs.conditions] : [];
@@ -95,19 +92,11 @@ export function saveSettings() {
 
 // ─── Group Chat Helpers ─────────────────────────────────────────
 
-/**
- * Check if the current chat is a group chat.
- * @returns {boolean}
- */
 export function isGroupChat() {
     const context = getContext();
     return !!context.groupId;
 }
 
-/**
- * Get all character names in the current group.
- * @returns {string[]}
- */
 export function getGroupMemberNames() {
     const context = getContext();
     if (!context.groupId) return [];
@@ -121,32 +110,14 @@ export function getGroupMemberNames() {
         .filter(Boolean);
 }
 
-/**
- * Check if a chat has any active character (solo or group).
- * @returns {boolean}
- */
 function hasActiveChat() {
     const context = getContext();
-    if (context.groupId) return true; // Group chats always have members
+    if (context.groupId) return true;
     return context.characterId !== undefined && context.characterId !== null;
-}
-
-/**
- * Get the name of the character currently being responded for.
- * In solo chats, this is context.name2.
- * In group chats, this is also context.name2 (ST sets it to the current responder).
- * @returns {string|null}
- */
-function getCurrentCharName() {
-    const context = getContext();
-    return context.name2 || null;
 }
 
 // ─── Connection Profile ──────────────────────────────────────────
 
-/**
- * Look up a Connection Manager profile by ID (or name for backwards compat).
- */
 export function findConnectionProfile(profileId) {
     if (!profileId) return null;
     const profiles = getConnectionProfiles();
@@ -161,10 +132,6 @@ export function listConnectionProfiles() {
     return getConnectionProfiles().map(p => ({ id: p.id, name: p.name }));
 }
 
-/**
- * Store the sidecar's picks to be saved to the AI message when generation ends.
- * Called from sidecar-eval.js instead of saveToMetadata (which writes to the wrong message).
- */
 export function setPendingSidecarResult(expression, background) {
     _pendingSidecarExpression = expression || null;
     _pendingSidecarBackground = background || null;
@@ -174,12 +141,11 @@ export function setPendingSidecarResult(expression, background) {
 
 function suppressClassifier() {
     const settings = getSettings();
-    // Only suppress if expression tool is enabled — otherwise let ST's classifier handle expressions
     if (!settings.expressionToolEnabled) return;
 
     if (extension_settings.expressions) {
         _savedExpressionApi = extension_settings.expressions.api;
-        extension_settings.expressions.api = 99; // EXPRESSION_API.none
+        extension_settings.expressions.api = 99;
         console.log(`[${MODULE_NAME}] Suppressed ST classifier (was: ${_savedExpressionApi})`);
     }
 }
@@ -194,9 +160,6 @@ function restoreClassifier() {
 
 // ─── Slash Command Override ──────────────────────────────────────
 
-/**
- * Register (or re-register) the /bm and /bunmoji slash commands under BunMoji.
- */
 function registerSlashCommands() {
     try {
         SlashCommandParser.addCommandObject(SlashCommand.fromProps({
@@ -210,7 +173,6 @@ function registerSlashCommands() {
                     return '';
                 }
                 await restoreExpression(expression);
-                // Save to metadata so swipe/reload restores this manual pick
                 saveToMetadata('bunmoji_expression', expression);
                 await saveChatConditional();
                 return '';
@@ -273,13 +235,9 @@ async function uploadSprite(file, label) {
         body: form,
     });
 
-    // Register as a custom expression in ST so it appears in spriteCache
     ensureCustomExpression(label);
 }
 
-/**
- * Sync all current sprite labels to ST's custom expressions list.
- */
 async function syncCustomExpressions() {
     const sprites = await fetchSprites();
     const labels = [...new Set(sprites.map(s => s.label))];
@@ -292,9 +250,6 @@ async function syncCustomExpressions() {
     }
 }
 
-/**
- * @returns {boolean} true if a new custom expression was added
- */
 function ensureCustomExpression(label) {
     if (!label) return false;
     const defaults = new Set([
@@ -306,7 +261,6 @@ function ensureCustomExpression(label) {
     ]);
 
     if (defaults.has(label.toLowerCase())) return false;
-
     if (!extension_settings.expressions) return false;
     if (!Array.isArray(extension_settings.expressions.custom)) {
         extension_settings.expressions.custom = [];
@@ -377,7 +331,6 @@ async function handleConditionalSpriteUpload(files) {
             const label = labelFromFilename(file.name);
             try {
                 await uploadSprite(file, label);
-
                 const existing = settings.conditionalSprites.find(cs => cs.label === label);
                 if (!existing) {
                     settings.conditionalSprites.push({ label, conditionGroups: [] });
@@ -427,28 +380,29 @@ async function uploadSpriteZip(file) {
 
 // ─── Event Handlers ──────────────────────────────────────────────
 
+/**
+ * Pre-generation sidecar trigger.
+ * Stays close to original flow. Additions:
+ *   - Per-character tracking (Set instead of boolean) for group chat support
+ *   - Gate logic allows bg-only mode (skip sprite check when only backgrounds needed)
+ */
 async function onChatCompletionReady(data) {
     const settings = getSettings();
     if (!settings.enabled) return;
-    if (settings.evalTiming === 'after') return; // After-gen mode — skip pre-gen
+    if (settings.evalTiming === 'after') return;
 
     const context = getContext();
     const lastMsg = context.chat?.slice(-1)?.[0];
 
-    // Reset per-character tracking when a new user message arrives
-    if (lastMsg?.is_user) {
-        const msgId = context.chat.length - 1;
-        if (msgId !== _lastUserMessageId) {
-            _lastUserMessageId = msgId;
-            _sidecarRanForChars.clear();
-        }
-    }
+    // Reset tracking on new user message — mirrors original: if (lastMsg?.is_user) flag = false
+    if (lastMsg?.is_user) _sidecarRanForChars.clear();
 
-    const charName = getCurrentCharName();
-    if (!charName) return;
+    // Per-character tracking for group chats. In solo, charName is always the same
+    // so the Set acts identically to the original boolean.
+    const charName = context.name2 || null;
 
-    // Skip if we already ran sidecar for this character this turn
-    if (_sidecarRanForChars.has(charName)) return;
+    if (charName && _sidecarRanForChars.has(charName)) return;
+    if (!charName && _sidecarRanForChars.size > 0) return;
 
     if (_slashCommandCooldown && Date.now() - _slashCommandCooldown < 3000) {
         _slashCommandCooldown = 0;
@@ -457,25 +411,28 @@ async function onChatCompletionReady(data) {
 
     if (lastMsg?.extra?.tool_invocations != null) return;
 
-    // Check if we have anything to do — need either sprites (if expressions enabled) or backgrounds
+    // Gate: do we have anything to do?
     const expressionsEnabled = settings.expressionToolEnabled;
     const backgroundsEnabled = settings.bgToolEnabled;
 
     if (expressionsEnabled) {
+        // Original behavior: skip if no sprites cached. But allow through if backgrounds are on.
         const cached = getCachedSpriteLabels();
         if (cached.length === 0 && !backgroundsEnabled) return;
     } else if (!backgroundsEnabled) {
-        return; // Neither expressions nor backgrounds enabled
+        return; // Neither tool enabled
     }
+    // If expressions OFF but backgrounds ON, skip sprite check entirely — proceed to sidecar.
 
-    _sidecarRanForChars.add(charName);
+    _sidecarRanForChars.add(charName || '__solo__');
     await runSidecar(charName);
 }
 
 
 /**
  * Called on MESSAGE_RECEIVED — the AI message is now in chat.
- * Save the sidecar's pending picks to this message's metadata.
+ * Saves pending sidecar picks to this message's metadata.
+ * Also runs the sidecar in after-gen mode.
  */
 async function onMessageReceived(messageId) {
     const settings = getSettings();
@@ -484,27 +441,34 @@ async function onMessageReceived(messageId) {
     const context = getContext();
     const msg = context.chat?.[messageId];
 
-    // After-gen mode: run sidecar now that the AI response is complete
+    // After-gen mode: run sidecar now that the AI response exists
     if (settings.evalTiming === 'after' && msg && !msg.is_user) {
-        const charName = msg.name || getCurrentCharName();
-        if (!charName) return;
-        if (_sidecarRanForChars.has(charName)) return;
+        const charName = msg.name || context.name2 || null;
 
-        const expressionsEnabled = settings.expressionToolEnabled;
-        const backgroundsEnabled = settings.bgToolEnabled;
+        if (charName && _sidecarRanForChars.has(charName)) {
+            // Already ran — skip
+        } else if (!charName && _sidecarRanForChars.size > 0) {
+            // No name and already ran — skip
+        } else {
+            const expressionsEnabled = settings.expressionToolEnabled;
+            const backgroundsEnabled = settings.bgToolEnabled;
+            let shouldRun = false;
 
-        if (expressionsEnabled) {
-            if (getCachedSpriteLabels().length === 0 && !backgroundsEnabled) return;
-        } else if (!backgroundsEnabled) {
-            return;
+            if (expressionsEnabled) {
+                shouldRun = getCachedSpriteLabels().length > 0 || backgroundsEnabled;
+            } else {
+                shouldRun = backgroundsEnabled;
+            }
+
+            if (shouldRun) {
+                if (_slashCommandCooldown && Date.now() - _slashCommandCooldown < 3000) {
+                    _slashCommandCooldown = 0;
+                } else {
+                    _sidecarRanForChars.add(charName || '__solo__');
+                    await runSidecar(charName);
+                }
+            }
         }
-
-        if (_slashCommandCooldown && Date.now() - _slashCommandCooldown < 3000) {
-            _slashCommandCooldown = 0;
-            return;
-        }
-        _sidecarRanForChars.add(charName);
-        await runSidecar(charName);
     }
 
     // Save pending sidecar picks to the new AI message
@@ -536,16 +500,12 @@ async function applyFallbackIfNeeded() {
 
 // ─── Swipe / Chat Restoration ────────────────────────────────────
 
-/**
- * Read the last AI message's metadata and re-apply saved expression/background.
- */
 async function restoreFromMetadata() {
     if (!getSettings().enabled) return;
 
     const context = getContext();
     const settings = getSettings();
 
-    // Expression restoration (only if expression tool is enabled)
     if (settings.expressionToolEnabled) {
         const recentWithExpr = [...(context.chat || [])].reverse().find(m => m.extra?.bunmoji_expression);
         const savedExpression = recentWithExpr?.extra?.bunmoji_expression;
@@ -554,7 +514,6 @@ async function restoreFromMetadata() {
         }
     }
 
-    // Background restoration
     const recentWithBg = [...(context.chat || [])].reverse().find(m => m.extra?.bunmoji_background);
     const savedBg = recentWithBg?.extra?.bunmoji_background;
     if (savedBg && settings.bgToolEnabled) {
@@ -584,10 +543,7 @@ async function renderExpressionGrid() {
     const $grid = $('#bm_label_grid');
     if (!$grid.length) return;
 
-    const context = getContext();
     const hasChat = hasActiveChat();
-
-    // Fade entire panel when no character/group is active
     $('#bm_main_controls').toggleClass('bm-no-character', !hasChat);
 
     if (!hasChat) {
@@ -600,9 +556,9 @@ async function renderExpressionGrid() {
         return;
     }
 
-    // In group chats, show info about the current character context
+    const context = getContext();
     const inGroup = isGroupChat();
-    const charName = getCurrentCharName();
+    const charName = context.name2;
 
     if (inGroup && !charName) {
         $grid.html(`
@@ -648,7 +604,6 @@ async function renderExpressionGrid() {
         `;
     }).join('');
 
-    // Add group indicator at top if in group chat
     let groupHeader = '';
     if (inGroup) {
         groupHeader = `<div class="bm-group-indicator" style="grid-column: 1 / -1; text-align: center; font-size: 10px; opacity: 0.6; padding: 4px 0;">
@@ -658,7 +613,6 @@ async function renderExpressionGrid() {
 
     $grid.html(groupHeader + cards);
 
-    // Populate fallback expression dropdown
     const $fallback = $('#bm_fallback_expression');
     if ($fallback.length && labels.length > 0) {
         let fallbackHtml = '';
@@ -688,7 +642,6 @@ async function renderConditionalSprites() {
         return;
     }
 
-    // Fetch sprites to get thumbnail paths
     const sprites = await fetchSprites();
     const spriteMap = {};
     for (const s of sprites) {
@@ -810,7 +763,6 @@ function renderConditionalBackgrounds() {
     $list.html(cards);
 }
 
-
 function renderConnectionProfiles() {
     const $select = $('#bm_connection_profile');
     if (!$select.length) return;
@@ -828,9 +780,6 @@ function renderConnectionProfiles() {
 
 // ─── Tag-Pill Condition Editor ────────────────────────────────────
 
-/**
- * Build HTML for condition pills with OR separators between groups.
- */
 function buildPillsHtml(groups, editable = false) {
     if (!groups || groups.length === 0) return '<span class="bm-cond-empty-hint">No conditions set</span>';
 
@@ -856,7 +805,6 @@ function toggleTagEditor(index) {
     const $card = $(`.bm-cond-sprite-card[data-cond-index="${index}"]`);
     if (!$card.length) return;
 
-    // Close any existing editor
     $('.bm-tag-editor').remove();
 
     if ($card.data('editor-open')) {
@@ -952,13 +900,11 @@ function toggleBgTagEditor(index) {
 // ─── Event Bindings ──────────────────────────────────────────────
 
 function bindUIEvents() {
-    // Header toggle
     $('#bm_header_toggle').on('click', function () {
         $(this).toggleClass('expanded');
         $(this).closest('.bm-container').find('.bm-settings-body').slideToggle(200);
     });
 
-    // Global enable
     $('#bm_global_enabled').on('change', async function () {
         const settings = getSettings();
         settings.enabled = $(this).prop('checked');
@@ -984,13 +930,11 @@ function bindUIEvents() {
         }
     });
 
-    // Expression tool toggle
     $('#bm_expression_enabled').on('change', async function () {
         const settings = getSettings();
         settings.expressionToolEnabled = $(this).prop('checked');
         saveSettings();
 
-        // Toggle classifier suppression based on expression tool state
         if (settings.enabled) {
             if (settings.expressionToolEnabled) {
                 suppressClassifier();
@@ -999,17 +943,14 @@ function bindUIEvents() {
             }
         }
 
-        // Toggle visibility of expression-related UI sections
         updateExpressionSectionsVisibility();
     });
 
-    // Collapsible sections
     $('.bm-card-header-collapsible').on('click', function () {
         $(this).toggleClass('expanded');
         $(this).next('.bm-card-body').slideToggle(200);
     });
 
-    // Drop zone
     const $dropZone = $('#bm_drop_zone');
     $dropZone.on('click', () => $('#bm_file_input').trigger('click'));
     $dropZone.on('dragover', (e) => { e.preventDefault(); $dropZone.addClass('dragover'); });
@@ -1020,23 +961,19 @@ function bindUIEvents() {
         if (files?.length) await handleFileUpload(files);
     });
 
-    // File input
     $('#bm_file_input').on('change', async function () {
         if (this.files?.length) await handleFileUpload(this.files);
         $(this).val('');
     });
 
-    // Browse button
     $('#bm_upload_sprites').on('click', () => $('#bm_file_input').trigger('click'));
 
-    // Refresh
     $('#bm_refresh_labels').on('click', async () => {
         invalidateCache();
         await renderExpressionGrid();
         toastr.info('Refreshed expressions.', MODULE_NAME);
     });
 
-    // Conditional sprite drop zone
     const $condDropZone = $('#bm_cond_drop_zone');
     $condDropZone.on('click', () => $('#bm_cond_file_input').trigger('click'));
     $condDropZone.on('dragover', (e) => { e.preventDefault(); $condDropZone.addClass('dragover'); });
@@ -1047,29 +984,24 @@ function bindUIEvents() {
         if (files?.length) await handleConditionalSpriteUpload(files);
     });
 
-    // Conditional sprite file input
     $('#bm_cond_file_input').on('change', async function () {
         if (this.files?.length) await handleConditionalSpriteUpload(this.files);
         $(this).val('');
     });
 
-    // Conditional sprite browse button
     $('#bm_cond_upload').on('click', () => $('#bm_cond_file_input').trigger('click'));
 
-    // Edit conditions on conditional sprite
     $(document).on('click', '.bm-cond-edit', function (e) {
         e.stopPropagation();
         const index = parseInt($(this).closest('.bm-cond-sprite-card').data('cond-index'), 10);
         toggleTagEditor(index);
     });
 
-    // Tag editor: toggle NOT button
     $(document).on('click', '.bm-tag-negate-btn', function (e) {
         e.stopPropagation();
         $(this).toggleClass('active');
     });
 
-    // Tag editor: add condition to current (last) group
     $(document).on('click', '.bm-tag-add-btn', function (e) {
         e.stopPropagation();
         const $editor = $(this).closest('.bm-tag-editor');
@@ -1090,7 +1022,6 @@ function bindUIEvents() {
         $editor.find('.bm-tag-negate-btn').removeClass('active');
     });
 
-    // Tag editor: enter key in value input adds condition
     $(document).on('keydown', '.bm-tag-value', function (e) {
         if (e.key === 'Enter') {
             e.preventDefault();
@@ -1098,7 +1029,6 @@ function bindUIEvents() {
         }
     });
 
-    // Tag editor: start new OR group
     $(document).on('click', '.bm-tag-or-btn', function (e) {
         e.stopPropagation();
         const $editor = $(this).closest('.bm-tag-editor');
@@ -1110,7 +1040,6 @@ function bindUIEvents() {
         $editor.find('.bm-tag-display').html(buildPillsHtml(workingGroups, true));
     });
 
-    // Tag editor: remove a pill
     $(document).on('click', '.bm-pill-x', function (e) {
         e.stopPropagation();
         const $pill = $(this).closest('.bm-cond-pill');
@@ -1130,7 +1059,6 @@ function bindUIEvents() {
         $editor.find('.bm-tag-display').html(buildPillsHtml(workingGroups, true));
     });
 
-    // Tag editor: save
     $(document).on('click', '.bm-tag-save', async function (e) {
         e.stopPropagation();
         const $editor = $(this).closest('.bm-tag-editor');
@@ -1158,7 +1086,6 @@ function bindUIEvents() {
         toastr.success('Conditions updated.', MODULE_NAME);
     });
 
-    // Tag editor: cancel
     $(document).on('click', '.bm-tag-cancel', async function (e) {
         e.stopPropagation();
         const $editor = $(this).closest('.bm-tag-editor');
@@ -1170,7 +1097,6 @@ function bindUIEvents() {
         }
     });
 
-    // Delete conditional sprite
     $(document).on('click', '.bm-cond-remove', async function (e) {
         e.stopPropagation();
         const index = parseInt($(this).closest('.bm-cond-sprite-card').data('cond-index'), 10);
@@ -1180,14 +1106,12 @@ function bindUIEvents() {
         await renderConditionalSprites();
     });
 
-    // Fallback expression
     $('#bm_fallback_expression').on('change', function () {
         const settings = getSettings();
         settings.fallbackExpression = $(this).val();
         saveSettings();
     });
 
-    // Connection profile
     $('#bm_connection_profile').on('change', function () {
         const settings = getSettings();
         settings.connectionProfile = $(this).val() || null;
@@ -1213,7 +1137,6 @@ function bindUIEvents() {
         saveSettings();
     });
 
-    // Background tool toggle
     $('#bm_bg_enabled').on('change', async function () {
         const settings = getSettings();
         settings.bgToolEnabled = $(this).prop('checked');
@@ -1224,7 +1147,6 @@ function bindUIEvents() {
         }
     });
 
-    // Add conditional background
     $(document).on('click', '.bm-bg-add-cond', async function (e) {
         e.stopPropagation();
         const filename = $(this).closest('.bm-bg-card').data('filename');
@@ -1250,14 +1172,12 @@ function bindUIEvents() {
         }
     });
 
-    // Edit conditions on a bg conditional card
     $(document).on('click', '.bm-bg-cond-edit', function (e) {
         e.stopPropagation();
         const index = parseInt($(this).closest('.bm-cond-bg-card').data('bg-index'), 10);
         toggleBgTagEditor(index);
     });
 
-    // Delete conditional background
     $(document).on('click', '.bm-bg-cond-delete', function (e) {
         e.stopPropagation();
         const index = parseInt($(this).closest('.bm-cond-bg-card').data('bg-index'), 10);
@@ -1268,7 +1188,6 @@ function bindUIEvents() {
         renderBgGallery();
     });
 
-    // Inline label editing
     $(document).on('click', '.bm-editable-label', function (e) {
         e.stopPropagation();
         const $label = $(this);
@@ -1325,7 +1244,6 @@ function bindUIEvents() {
         });
     });
 
-    // Promote label sprite to conditional
     $(document).on('click', '.bm-sprite-promote', async function (e) {
         e.stopPropagation();
         const fileLabel = $(this).data('file-label');
@@ -1343,7 +1261,6 @@ function bindUIEvents() {
         toastr.info(`Moved "${getDisplayLabel(fileLabel)}" to conditionals.`, MODULE_NAME);
     });
 
-    // Demote conditional sprite to label
     $(document).on('click', '.bm-cond-demote', async function (e) {
         e.stopPropagation();
         const index = parseInt($(this).closest('.bm-cond-sprite-card').data('cond-index'), 10);
@@ -1366,7 +1283,6 @@ function bindUIEvents() {
         }
     });
 
-    // Sprite enable/disable toggle
     $(document).on('click', '.bm-sprite-toggle', async function (e) {
         e.stopPropagation();
         const fileLabel = $(this).data('file-label');
@@ -1384,7 +1300,6 @@ function bindUIEvents() {
         await renderExpressionGrid();
     });
 
-    // Conditional sprite eye toggle
     $(document).on('click', '.bm-cond-toggle', async function (e) {
         e.stopPropagation();
         const fileLabel = $(this).data('file-label');
@@ -1402,7 +1317,6 @@ function bindUIEvents() {
         await renderConditionalSprites();
     });
 
-    // Diagnostics
     $('#bm_run_diagnostics').on('click', async () => {
         const $output = $('#bm_diagnostics_output');
         $output.show();
@@ -1443,7 +1357,6 @@ function bindUIEvents() {
 function updateExpressionSectionsVisibility() {
     const settings = getSettings();
     const exprEnabled = settings.expressionToolEnabled;
-    // Show/hide expression-specific sections
     $('#bm_label_sprites_card').toggle(exprEnabled);
     $('#bm_conditional_sprites_card').toggle(exprEnabled);
 }
@@ -1492,18 +1405,14 @@ jQuery(async () => {
 
     eventSource.on(event_types.CHAT_COMPLETION_SETTINGS_READY, onChatCompletionReady);
     eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
-    eventSource.on(event_types.GENERATION_STOPPED, () => {
-        // Don't clear in groups — let the per-user-message tracking handle it
-        if (!isGroupChat()) {
-            _sidecarRanForChars.clear();
-        }
-    });
+
+    // Always reset on GENERATION_STOPPED — matches original behavior
+    eventSource.on(event_types.GENERATION_STOPPED, () => { _sidecarRanForChars.clear(); });
 
     eventSource.on(event_types.CHAT_CHANGED, async () => {
         invalidateCache();
         invalidateBgCache();
         _sidecarRanForChars.clear();
-        _lastUserMessageId = -1;
 
         const chatSettings = getSettings();
         if (chatSettings.enabled) {

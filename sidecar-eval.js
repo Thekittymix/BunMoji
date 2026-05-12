@@ -22,7 +22,7 @@ import { setSidecarActive, addFeedItem } from './activity-feed.js';
 
 /**
  * Run the sidecar — single call handles conditionals + selection.
- * @param {string} [charName] - Character name to evaluate for (required in group chats, optional in solo)
+ * @param {string} [charName] - Character name to evaluate for (used in group chats)
  * @returns {Promise<SidecarResult>}
  */
 export async function runSidecar(charName) {
@@ -34,6 +34,7 @@ export async function runSidecar(charName) {
     }
 
     const context = getContext();
+    // Use provided charName, fall back to context.name2 (matches original solo behavior)
     const resolvedCharName = charName || context.name2 || 'the character';
     const msgCount = settings.contextMessages || 10;
     const recentMessages = (context.chat || [])
@@ -48,12 +49,14 @@ export async function runSidecar(charName) {
     const expressionsEnabled = settings.expressionToolEnabled;
     const bgEnabled = settings.bgToolEnabled;
 
-    // Gather expression options (only if expression tool is enabled)
+    // Gather all options
     const disabledConds = new Set(settings.disabledConditionals || []);
     const conditionalSprites = expressionsEnabled
         ? (settings.conditionalSprites || []).filter(cs => !disabledConds.has(cs.label))
         : [];
     const conditionalBgs = settings.conditionalBackgrounds || [];
+    // When expressions are enabled, fetch labels for the specific character (group support).
+    // When disabled, pass empty — sidecar won't offer expression tool.
     const spriteLabels = expressionsEnabled ? await getAvailableLabels(charName) : [];
     const bgFilenames = bgEnabled ? await fetchBackgroundsList() : [];
 
@@ -75,10 +78,6 @@ export async function runSidecar(charName) {
     try {
         // Build tools with ALL options in enum
         const tools = buildSelectionTools(allSpriteOptions, allBgOptions, bgEnabled, resolvedCharName);
-
-        if (tools.length === 0) {
-            return { expression: null, background: null };
-        }
 
         // Get current state for context (if setting enabled)
         let currentExpression = null;
@@ -200,9 +199,6 @@ export async function runSidecar(charName) {
 
 // ─── Unified Prompt Builder ─────────────────────────────────────
 
-/**
- * Build a single prompt that handles conditionals + selection.
- */
 function buildUnifiedPrompt({ recentMessages, spriteLabels, conditionalSprites, conditionalBgs, bgFilenames, bgEnabled, expressionsEnabled = true, jsonMode = false, currentExpression = null, currentBackground = null, charName = 'the character' }) {
     let prompt = 'Current scene:\n' + recentMessages + '\n\n';
 
@@ -226,7 +222,7 @@ function buildUnifiedPrompt({ recentMessages, spriteLabels, conditionalSprites, 
         prompt += `Label expressions (always available): ${spriteLabels.join(', ')}\n\n`;
     }
 
-    // Conditional expressions with their condition groups (only if expressions enabled)
+    // Conditional expressions with their condition groups
     if (hasCondSprites) {
         prompt += 'Conditional expressions (available ONLY if their conditions are met):\n';
         prompt += 'Condition types:\n';
@@ -254,7 +250,7 @@ function buildUnifiedPrompt({ recentMessages, spriteLabels, conditionalSprites, 
         prompt += '\n';
     }
 
-    // Priority rules (only if expressions enabled)
+    // Priority rules
     if (hasCondSprites) {
         prompt += 'RULES for conditional expressions:\n';
         prompt += '1. For each conditional, evaluate its condition groups. A group passes when ALL its conditions are met.\n';
