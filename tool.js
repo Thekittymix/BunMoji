@@ -2,8 +2,6 @@
  * BunMoji Sprite & Background Helpers
  * Provides sprite label fetching, background listing, and apply functions.
  * No ToolManager registration -- the sidecar handles selection.
- *
- * Modified: Group chat support — functions accept optional explicit character names.
  */
 
 import { getContext, extension_settings } from '../../../extensions.js';
@@ -17,33 +15,24 @@ import { getSettings } from './index.js';
 let _spriteCache = new Map();
 
 /**
- * Get the correct sprite folder name for a character,
+ * Get the correct sprite folder name for the current character,
  * respecting ST's expression overrides.
- * @param {string} [charName] - Explicit character name (for group chats). Falls back to context.name2.
  */
-export function getSpriteFolderName(charName) {
+export function getSpriteFolderName() {
     const context = getContext();
-    // Default to provided name or character display name
-    let folderName = charName || context.name2 || null;
+    // Default to character display name (matches ST's sprite folder convention)
+    let folderName = context.name2 || null;
 
     // Check for expression override by avatar filename
-    // In group chats, characterId is undefined, so we search by name
-    let char = null;
-    if (charName) {
-        // Find the character object by name
-        char = context.characters?.find(c => c.name === charName);
-    } else {
-        const charId = context.characterId;
-        if (charId !== undefined && charId !== null) {
-            char = context.characters[charId];
-        }
-    }
-
-    if (char?.avatar) {
-        const avatarKey = char.avatar.replace(/\.[^/.]+$/, '');
-        const override = extension_settings.expressionOverrides?.find(e => e.name === avatarKey);
-        if (override?.path) {
-            folderName = override.path;
+    const charId = context.characterId;
+    if (charId !== undefined && charId !== null) {
+        const char = context.characters[charId];
+        if (char?.avatar) {
+            const avatarKey = char.avatar.replace(/\.[^/.]+$/, '');
+            const override = extension_settings.expressionOverrides?.find(e => e.name === avatarKey);
+            if (override?.path) {
+                folderName = override.path;
+            }
         }
     }
 
@@ -80,11 +69,11 @@ export function invalidateCache() {
 
 /**
  * Get cached sprite labels synchronously (for slash command enum providers).
- * @param {string} [charName] - Optional character name for group chats.
+ * Returns empty array if cache is not populated yet for the current character.
  * @returns {string[]}
  */
-export function getCachedSpriteLabels(charName) {
-    let folderName = getSpriteFolderName(charName);
+export function getCachedSpriteLabels() {
+    let folderName = getSpriteFolderName();
     if (!folderName) {
         const context = getContext();
         folderName = context.name2 || null;
@@ -98,10 +87,11 @@ export function getCachedSpriteLabels(charName) {
 
 /**
  * Pre-warm the sprite label cache for the current character.
- * @param {string} [charName] - Optional character name for group chats.
+ * Call on init and chat change so slash command autocomplete works immediately.
+ * Tries getSpriteFolderName first, falls back to context.name2.
  */
-export async function warmSpriteCache(charName) {
-    let folderName = getSpriteFolderName(charName);
+export async function warmSpriteCache() {
+    let folderName = getSpriteFolderName();
     if (!folderName) {
         const context = getContext();
         folderName = context.name2 || null;
@@ -127,7 +117,7 @@ export async function warmGroupSpriteCache() {
     for (const avatarFile of group.members) {
         const char = context.characters?.find(c => c.avatar === avatarFile);
         if (char?.name) {
-            const folderName = getSpriteFolderName(char.name);
+            const folderName = getSpriteFolderName();
             if (folderName) {
                 promises.push(fetchSpriteLabels(folderName));
             }
@@ -137,12 +127,12 @@ export async function warmGroupSpriteCache() {
 }
 
 /**
- * Get available base sprite labels (without conditionals).
- * @param {string} [charName] - Optional character name for group chats.
+ * Get available base sprite labels (without conditionals -- sidecar handles those).
+ * Returns display labels (aliases where set, file labels otherwise).
  * @returns {Promise<string[]>}
  */
-export async function getAvailableLabels(charName) {
-    const folderName = getSpriteFolderName(charName);
+export async function getAvailableLabels() {
+    const folderName = getSpriteFolderName();
     const fileLabels = await fetchSpriteLabels(folderName);
     const settings = getSettings();
     const aliases = settings.labelAliases || {};
@@ -156,17 +146,20 @@ export async function getAvailableLabels(charName) {
 
 /**
  * Resolve a display label back to the original file label.
- * @param {string} displayLabel
- * @returns {string}
+ * If no alias matches, returns the input unchanged (it may already be a file label).
+ * @param {string} displayLabel - The label shown to the sidecar/user
+ * @returns {string} The actual file-based label for sendExpressionCall
  */
 export function resolveFileLabel(displayLabel) {
     if (!displayLabel) return displayLabel;
     const settings = getSettings();
     const aliases = settings.labelAliases || {};
 
+    // Check if any file label has this as its alias
     for (const [fileLabel, alias] of Object.entries(aliases)) {
         if (alias === displayLabel) return fileLabel;
     }
+    // No alias found — it's already a file label
     return displayLabel;
 }
 
@@ -236,8 +229,8 @@ export async function applyBackground(filename) {
 
 /**
  * Save a key/value pair to the last AI message's metadata.
- * @param {string} key
- * @param {*} value
+ * @param {string} key - Metadata key (e.g. 'bunmoji_expression')
+ * @param {*} value - Value to save
  */
 export function saveToMetadata(key, value) {
     const context = getContext();
@@ -251,14 +244,15 @@ export function saveToMetadata(key, value) {
 // ─── Swipe Restoration Helpers ───────────────────────────────────
 
 /**
- * Restore a saved expression label.
- * @param {string} expression - The expression label to restore
- * @param {string} [charName] - Optional character name for group chats
+ * Restore a saved expression label. Used by swipe/chat restoration.
+ * Accepts either a display label (alias) or a file label -- resolves internally.
+ * @param {string} expression - The expression label to restore (display or file label)
  */
-export async function restoreExpression(expression, charName) {
+export async function restoreExpression(expression) {
     if (!expression) return;
-    const folderName = getSpriteFolderName(charName);
+    const folderName = getSpriteFolderName();
     if (!folderName) return;
+    // Resolve alias -- expression might be a display label
     const fileLabel = resolveFileLabel(expression);
     try {
         await sendExpressionCall(folderName, fileLabel, { force: true });

@@ -1,13 +1,11 @@
 /**
  * BunMoji Diagnostics
  * Checks for common configuration issues and provides fixes.
- *
- * Modified: Group chat awareness.
  */
 
 import { getContext, extension_settings } from '../../../extensions.js';
 import { getRequestHeaders } from '../../../../script.js';
-import { getSettings, findConnectionProfile, isGroupChat, getGroupMemberNames } from './index.js';
+import { getSettings, findConnectionProfile } from './index.js';
 import { isSidecarKeyAvailable } from './llm-sidecar.js';
 
 // Default ST expressions that do not need to be in extension_settings.expressions.custom
@@ -45,19 +43,8 @@ export async function runDiagnostics() {
         fix: settings.enabled ? null : 'Toggle "Enable BunMoji" on.',
     });
 
-    // 1b. Expression tool state
+    // 2. ST Expressions classifier suppressed
     if (settings.enabled) {
-        results.push({
-            status: 'pass',
-            label: 'Expression Tool',
-            detail: settings.expressionToolEnabled
-                ? 'Expression tool is enabled. Sidecar picks expressions.'
-                : 'Expression tool is disabled. Only backgrounds are handled by sidecar. ST\'s classifier handles expressions.',
-        });
-    }
-
-    // 2. ST Expressions classifier suppressed (only relevant if expression tool is ON)
-    if (settings.enabled && settings.expressionToolEnabled) {
         const api = extension_settings.expressions?.api;
         results.push({
             status: api === 99 ? 'pass' : 'warn',
@@ -65,104 +52,47 @@ export async function runDiagnostics() {
             detail: api === 99
                 ? 'ST\'s built-in expression classifier is suppressed (API = None).'
                 : `ST\'s classifier is still active (API = ${api}). It may overwrite BunMoji expressions.`,
-            fix: api === 99 ? null : 'This should auto-suppress when BunMoji is enabled with expressions on. Try toggling BunMoji off and on.',
+            fix: api === 99 ? null : 'This should auto-suppress when BunMoji is enabled. Try toggling BunMoji off and on.',
         });
     }
 
-    // 2b. Chat type detection
-    const inGroup = isGroupChat();
-    if (inGroup) {
-        const members = getGroupMemberNames();
-        results.push({
-            status: 'pass',
-            label: 'Chat Type',
-            detail: `Group chat detected with ${members.length} member(s): ${members.slice(0, 5).join(', ')}${members.length > 5 ? '...' : ''}`,
-        });
-    } else {
-        results.push({
-            status: 'pass',
-            label: 'Chat Type',
-            detail: 'Solo chat detected.',
-        });
-    }
-
-    // 3. Active character(s) have sprites
+    // 3. Active character has sprites
     const context = getContext();
-
-    if (inGroup) {
-        // Check sprites for all group members
-        const members = getGroupMemberNames();
-        let totalWithSprites = 0;
-        let totalWithout = [];
-
-        for (const memberName of members) {
-            try {
-                const res = await fetch(`/api/sprites/get?name=${encodeURIComponent(memberName)}`, {
-                    headers: getRequestHeaders(),
-                });
-                const sprites = res.ok ? await res.json() : [];
-                const labels = [...new Set(sprites.map(s => s.label))];
-                if (labels.length > 0) {
-                    totalWithSprites++;
-                } else {
-                    totalWithout.push(memberName);
-                }
-            } catch {
-                totalWithout.push(memberName);
-            }
-        }
-
-        if (totalWithout.length === 0) {
-            results.push({
-                status: 'pass',
-                label: 'Group Sprites',
-                detail: `All ${members.length} group members have sprites.`,
+    const charName = context.name2;
+    if (charName) {
+        try {
+            const res = await fetch(`/api/sprites/get?name=${encodeURIComponent(charName)}`, {
+                headers: getRequestHeaders(),
             });
-        } else {
+            const sprites = res.ok ? await res.json() : [];
+            const labels = [...new Set(sprites.map(s => s.label))];
             results.push({
-                status: settings.expressionToolEnabled ? 'warn' : 'pass',
-                label: 'Group Sprites',
-                detail: `${totalWithSprites}/${members.length} members have sprites. Missing: ${totalWithout.join(', ')}`,
-                fix: settings.expressionToolEnabled ? 'Upload sprites for missing members, or disable expression tool to use background-only mode.' : null,
+                status: labels.length > 0 ? 'pass' : 'fail',
+                label: 'Character Sprites',
+                detail: labels.length > 0
+                    ? `Found ${labels.length} expression(s) for "${charName}": ${labels.slice(0, 8).join(', ')}${labels.length > 8 ? '...' : ''}`
+                    : `No sprites found for "${charName}".`,
+                fix: labels.length > 0 ? null : `Upload sprite images to "data/characters/${charName}/" or use the drop zone above.`,
+            });
+        } catch {
+            results.push({
+                status: 'fail',
+                label: 'Character Sprites',
+                detail: 'Failed to fetch sprite list from server.',
             });
         }
     } else {
-        const charName = context.name2;
-        if (charName) {
-            try {
-                const res = await fetch(`/api/sprites/get?name=${encodeURIComponent(charName)}`, {
-                    headers: getRequestHeaders(),
-                });
-                const sprites = res.ok ? await res.json() : [];
-                const labels = [...new Set(sprites.map(s => s.label))];
-                results.push({
-                    status: labels.length > 0 ? 'pass' : (settings.expressionToolEnabled ? 'fail' : 'pass'),
-                    label: 'Character Sprites',
-                    detail: labels.length > 0
-                        ? `Found ${labels.length} expression(s) for "${charName}": ${labels.slice(0, 8).join(', ')}${labels.length > 8 ? '...' : ''}`
-                        : `No sprites found for "${charName}".${!settings.expressionToolEnabled ? ' (OK — expression tool is off)' : ''}`,
-                    fix: labels.length > 0 || !settings.expressionToolEnabled ? null : `Upload sprite images to "data/characters/${charName}/" or use the drop zone above.`,
-                });
-            } catch {
-                results.push({
-                    status: 'fail',
-                    label: 'Character Sprites',
-                    detail: 'Failed to fetch sprite list from server.',
-                });
-            }
-        } else {
-            results.push({
-                status: 'warn',
-                label: 'Character Sprites',
-                detail: 'No active character. Start a chat to check sprites.',
-            });
-        }
+        results.push({
+            status: 'warn',
+            label: 'Character Sprites',
+            detail: 'No active character. Start a chat to check sprites.',
+        });
     }
 
     // 4. Expressions extension loaded
     const expressionsLoaded = typeof extension_settings.expressions === 'object';
     results.push({
-        status: expressionsLoaded ? 'pass' : (settings.expressionToolEnabled ? 'fail' : 'warn'),
+        status: expressionsLoaded ? 'pass' : 'fail',
         label: 'Expressions Extension',
         detail: expressionsLoaded
             ? 'ST\'s Expressions extension is loaded.'
@@ -267,49 +197,48 @@ export async function runDiagnostics() {
         }
     }
 
-    // 8. Custom expressions registered (only if expression tool is on)
-    if (settings.expressionToolEnabled) {
-        const charName = context.name2;
-        if (charName && expressionsLoaded) {
-            try {
-                const res = await fetch(`/api/sprites/get?name=${encodeURIComponent(charName)}`, {
-                    headers: getRequestHeaders(),
-                });
-                const sprites = res.ok ? await res.json() : [];
-                const allLabels = [...new Set(sprites.map(s => s.label))];
-                const nonDefaultLabels = allLabels.filter(l => !DEFAULT_EXPRESSIONS.includes(l));
-                const customRegistered = Array.isArray(extension_settings.expressions?.custom)
-                    ? extension_settings.expressions.custom
-                    : [];
-                const unregistered = nonDefaultLabels.filter(l => !customRegistered.includes(l));
+    // 8. Custom expressions registered
+    // Non-default sprite labels must be in extension_settings.expressions.custom
+    // so ST's expression system can route them correctly.
+    if (charName && expressionsLoaded) {
+        try {
+            const res = await fetch(`/api/sprites/get?name=${encodeURIComponent(charName)}`, {
+                headers: getRequestHeaders(),
+            });
+            const sprites = res.ok ? await res.json() : [];
+            const allLabels = [...new Set(sprites.map(s => s.label))];
+            const nonDefaultLabels = allLabels.filter(l => !DEFAULT_EXPRESSIONS.includes(l));
+            const customRegistered = Array.isArray(extension_settings.expressions?.custom)
+                ? extension_settings.expressions.custom
+                : [];
+            const unregistered = nonDefaultLabels.filter(l => !customRegistered.includes(l));
 
-                if (nonDefaultLabels.length === 0) {
-                    results.push({
-                        status: 'pass',
-                        label: 'Custom Expressions Registered',
-                        detail: 'All sprite labels are standard ST expressions -- no custom registration needed.',
-                    });
-                } else if (unregistered.length === 0) {
-                    results.push({
-                        status: 'pass',
-                        label: 'Custom Expressions Registered',
-                        detail: `All ${nonDefaultLabels.length} non-default label(s) are registered in ST's custom expressions list.`,
-                    });
-                } else {
-                    results.push({
-                        status: 'warn',
-                        label: 'Custom Expressions Registered',
-                        detail: `${unregistered.length} sprite label(s) are not registered in ST's custom expressions: ${unregistered.join(', ')}. They may not display correctly.`,
-                        fix: 'Open the Expressions extension, click "Add Expression", and register each missing label.',
-                    });
-                }
-            } catch {
+            if (nonDefaultLabels.length === 0) {
+                results.push({
+                    status: 'pass',
+                    label: 'Custom Expressions Registered',
+                    detail: 'All sprite labels are standard ST expressions -- no custom registration needed.',
+                });
+            } else if (unregistered.length === 0) {
+                results.push({
+                    status: 'pass',
+                    label: 'Custom Expressions Registered',
+                    detail: `All ${nonDefaultLabels.length} non-default label(s) are registered in ST's custom expressions list.`,
+                });
+            } else {
                 results.push({
                     status: 'warn',
                     label: 'Custom Expressions Registered',
-                    detail: 'Could not fetch sprites to verify custom expression registration.',
+                    detail: `${unregistered.length} sprite label(s) are not registered in ST's custom expressions: ${unregistered.join(', ')}. They may not display correctly.`,
+                    fix: 'Open the Expressions extension, click "Add Expression", and register each missing label.',
                 });
             }
+        } catch {
+            results.push({
+                status: 'warn',
+                label: 'Custom Expressions Registered',
+                detail: 'Could not fetch sprites to verify custom expression registration.',
+            });
         }
     }
 

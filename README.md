@@ -16,8 +16,6 @@ ST's built-in expression system guesses emotions from text *after* the AI writes
 - 🔧 Native tool calling (Anthropic `tool_use`, OpenAI function calling, Google JSON fallback)
 - ⚡ Conditional sprites with narrative conditions (`[mood:tense]`, `[weather:rain]`, freeform)
 - 🖼️ Background switching from your existing ST gallery
-- 👥 **Group chat support** — sidecar runs per-character as each member responds
-- 🎬 **Background-only mode** — use just the background tool without expression picking
 - 📊 Activity feed showing what the sidecar picked and why
 - 💾 Expression metadata survives swipes, reloads, and manual overrides
 
@@ -28,7 +26,7 @@ ST's built-in expression system guesses emotions from text *after* the AI writes
 ### Prerequisites
 
 - 🖥️ SillyTavern (latest)
-- 🎨 Character(s) with sprite images in their folder
+- 🎨 Character with sprite images in their folder
 - 💰 A cheap/fast API for the sidecar (Haiku, Gemini Flash, DeepSeek, etc.)
 - 🔑 `allowKeysExposure: true` in ST's `config.yaml`
 
@@ -57,33 +55,6 @@ Toggle "Enable BunMoji." It suppresses ST's built-in classifier, registers your 
 ### 5. Chat 💬
 
 Send a message. Watch the activity feed glow ✨. Expression changes. Background changes. Done! 🎉
-
----
-
-## 👥 Group Chat Support
-
-BunMoji now works in group chats! The sidecar runs **per-character** — each time a group member responds, BunMoji evaluates their sprites independently.
-
-- Sprite caches are pre-warmed for all group members on chat open
-- Each character's expression is tracked separately in message metadata
-- The activity feed shows which character each pick is for (e.g. "Alice: joy")
-- Background picks are shared across the group (one background per scene)
-
-Just open a group chat with sprites on each character and BunMoji handles the rest.
-
----
-
-## 🎬 Background-Only Mode
-
-Want automatic background switching but prefer ST's built-in classifier for expressions? Toggle off **"Enable Expression Tool"** in BunMoji settings.
-
-When the expression tool is off:
-- ST's built-in expression classifier remains active (not suppressed)
-- The sidecar only picks backgrounds
-- Expression-related UI sections (label sprites, conditional sprites) are hidden
-- Lower token usage on the sidecar since it only evaluates backgrounds
-
-This is great for setups where you're happy with ST's local classifier for emotions but want intelligent background switching.
 
 ---
 
@@ -125,7 +96,7 @@ Enable to let the sidecar pick scene backgrounds from your ST gallery too. Same 
 ## 📊 Activity Feed
 
 Floating widget (bottom-left) shows what the sidecar is doing in real-time:
-- 🎭 Expression picks with reasoning (shows character name in groups)
+- 🎭 Expression picks with reasoning
 - 🖼️ Background picks with reasoning
 - ⚡ Conditional activations
 - ❌ Errors
@@ -177,7 +148,7 @@ Autocomplete shows available expressions with aliases. 💾
 
 ## 🩺 Diagnostics
 
-Run Diagnostics checks: extension state, classifier suppression, sprites found, sidecar configured, API key access, conditional validation, custom expression registration, group member sprite coverage. 🔧
+Run Diagnostics checks: extension state, classifier suppression, sprites found, sidecar configured, API key access, conditional validation, custom expression registration. 🔧
 
 ---
 
@@ -191,8 +162,6 @@ Run Diagnostics checks: extension state, classifier suppression, sprites found, 
 | Custom expressions | Manual setup | Auto-detected from files ✨ |
 | Conditionals | ❌ | ✅ With narrative conditions |
 | Backgrounds | Separate feature | Same sidecar call 🎬 |
-| Group chats | ✅ (classifier only) | ✅ Per-character sidecar 👥 |
-| Background-only | N/A | ✅ Toggle expressions off 🎬 |
 | Reasoning | Hidden 🙈 | Activity feed shows why 👀 |
 | Swipe persistence | Inconsistent 😬 | Always (metadata) 💾 |
 | Aliases | ❌ | Click to rename ✏️ |
@@ -203,14 +172,14 @@ Run Diagnostics checks: extension state, classifier suppression, sprites found, 
 
 ```
 BunMoji/
-├── 🎛️ index.js            Init, settings, UI, events, uploads, group chat logic
-├── 🔧 tool.js             Sprite/bg helpers, cache, alias resolution, per-char support
-├── 🧠 sidecar-eval.js     Prompt building, tool calling, response parsing, bg-only mode
+├── 🎛️ index.js            Init, settings, UI, events, uploads
+├── 🔧 tool.js             Sprite/bg helpers, cache, alias resolution
+├── 🧠 sidecar-eval.js     Prompt building, tool calling, response parsing
 ├── 📡 llm-sidecar.js      Direct API calls (Anthropic/OpenAI/Google)
 ├── ⚡ conditions.js       Condition type parsing
 ├── 📊 activity-feed.js    Floating feed widget
-├── 🩺 diagnostics.js      Health checks (group-aware)
-├── 🎨 settings.html       UI template (expression toggle, group info)
+├── 🩺 diagnostics.js      Health checks
+├── 🎨 settings.html       UI template
 ├── 💅 style.css           Styles
 └── 📋 manifest.json       Extension metadata
 ```
@@ -219,10 +188,10 @@ BunMoji/
 
 ## ⚠️ Known Limitations
 
+- 👤 Single-character chats only for now
 - 🔄 First upload of non-default sprite labels needs one page reload
 - ⌨️ Uses `/bm` command (doesn't override ST's `/sprite`)
-- ⏱️ Sidecar adds ~1-2s latency before each generation (per character in groups)
-- 👥 In groups, expression settings (aliases, conditionals) are shared across all characters
+- ⏱️ Sidecar adds ~1-2s latency before each generation
 
 ---
 
@@ -230,7 +199,7 @@ BunMoji/
 
 **🔭 Works with TunnelVision?** Yes! Independent extensions, separate sidecars recommended.
 
-**🎨 No sprites?** Enable background-only mode! Disable "Expression Tool" and enable "Background Tool."
+**🎨 No sprites?** BunMoji does nothing. Upload sprites first.
 
 **💰 Token cost?** Zero on main model. Sidecar is a separate cheap call.
 
@@ -239,10 +208,6 @@ BunMoji/
 **🔄 Reload needed after upload?** Once per new non-default label. Permanent after that.
 
 **😐 Fallback expression?** Configurable (default: neutral). Safety net when sidecar fails.
-
-**👥 Group chats?** Fully supported! Sidecar runs per-character.
-
-**🎬 Just backgrounds?** Toggle off "Enable Expression Tool" — sidecar only handles backgrounds.
 
 ---
 

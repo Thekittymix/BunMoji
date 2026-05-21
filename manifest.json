@@ -6,6 +6,6 @@
     "js": "index.js",
     "css": "style.css",
     "author": "Coneja-Chibi",
-    "version": "0.2.0",
-    "description": "Tool-called sprite expressions and background switching. The AI chooses character emotions as deliberate tool calls. Supports group chats and background-only mode."
+    "version": "0.1.0",
+    "description": "Tool-called sprite expressions. The AI chooses character emotions as deliberate tool calls instead of post-hoc classification."
 }
