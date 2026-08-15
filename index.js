@@ -20,11 +20,12 @@ const EXTENSION_NAME = 'bunmoji';
 const MODULE_NAME = 'BunMoji';
 
 // ─── Generation State ────────────────────────────────────────────
-let _savedExpressionApi = null;
 let _slashCommandCooldown = 0;
-let _sidecarRanForChars = new Set(); // Tracks which characters sidecar ran for this turn
+let _sidecarRanForChars = new Set(); // Tracks which characters sidecar ran for this turn (per-char for group chat support)
+let _skipSidecarThisGen = false; // true for quiet/impersonate generations (summarize, etc.)
 let _pendingSidecarExpression = null;
 let _pendingSidecarBackground = null;
+let _restoreTimer = null; // Handle for the delayed restoreFromMetadata() after CHAT_CHANGED
 
 // ─── Settings ────────────────────────────────────────────────────
 
@@ -139,19 +140,28 @@ function suppressClassifier() {
     const settings = getSettings();
     if (!settings.expressionToolEnabled) return; // Don't suppress if expression tool is off
 
-    if (extension_settings.expressions) {
-        _savedExpressionApi = extension_settings.expressions.api;
-        extension_settings.expressions.api = 99; // EXPRESSION_API.none
-        console.log(`[${MODULE_NAME}] Suppressed ST classifier (was: ${_savedExpressionApi})`);
+    if (!extension_settings.expressions) return;
+    // Snapshot ST's original values into our own persisted settings, once, before we
+    // start overwriting them -- so we can restore them even across a page reload.
+    if (!settings.classifierSnapshot) {
+        settings.classifierSnapshot = {
+            api: extension_settings.expressions.api ?? null,
+            fallbackExpression: extension_settings.expressions.fallback_expression ?? null,
+        };
+        saveSettings();
     }
+    extension_settings.expressions.api = 99; // EXPRESSION_API.none
+    console.log(`[${MODULE_NAME}] Suppressed ST classifier (was: ${settings.classifierSnapshot.api})`);
 }
 
 function restoreClassifier() {
-    if (_savedExpressionApi !== null && extension_settings.expressions) {
-        extension_settings.expressions.api = _savedExpressionApi;
-        console.log(`[${MODULE_NAME}] Restored ST classifier to: ${_savedExpressionApi}`);
-        _savedExpressionApi = null;
-    }
+    const settings = getSettings();
+    if (!settings.classifierSnapshot || !extension_settings.expressions) return;
+    extension_settings.expressions.api = settings.classifierSnapshot.api;
+    extension_settings.expressions.fallback_expression = settings.classifierSnapshot.fallbackExpression;
+    console.log(`[${MODULE_NAME}] Restored ST classifier to: ${settings.classifierSnapshot.api}`);
+    settings.classifierSnapshot = null;
+    saveSettings();
 }
 
 // ─── Slash Command Override ──────────────────────────────────────
@@ -237,11 +247,16 @@ async function uploadSprite(file, label) {
     const headers = getRequestHeaders();
     delete headers['Content-Type'];
 
-    await fetch('/api/sprites/upload', {
+    const res = await fetch('/api/sprites/upload', {
         method: 'POST',
         headers,
         body: form,
     });
+
+    if (!res.ok) {
+        const text = await res.text().catch(() => 'Unknown error');
+        throw new Error(`HTTP ${res.status}: ${text}`);
+    }
 
     // Register as a custom expression in ST so it appears in spriteCache
     ensureCustomExpression(label);
@@ -259,15 +274,14 @@ async function uploadSprite(file, label) {
 async function syncCustomExpressions() {
     const sprites = await fetchSprites();
     const labels = [...new Set(sprites.map(s => s.label))];
-    let added = 0;
     for (const label of labels) {
-        if (ensureCustomExpression(label)) added++;
+        ensureCustomExpression(label);
     }
-    // If we registered new custom expressions, force ST to rebuild its spriteCache
-    // by emitting CHAT_CHANGED (clears the cache) — moduleWorker rebuilds it on next tick
-    if (added > 0) {
-        eventSource.emit(event_types.CHAT_CHANGED);
-    }
+    // Newly-registered custom expressions get picked up the next time the expressions
+    // extension rebuilds its spriteCache on a real CHAT_CHANGED event -- we don't
+    // synthesize one here, since a bare CHAT_CHANGED with no chat id fans out to every
+    // other CHAT_CHANGED listener in the app (personas, presets, world-info, tags, etc.)
+    // and undoes the expressions extension's own cache instead of refreshing it.
 }
 
 /**
@@ -410,10 +424,11 @@ async function uploadSpriteZip(file) {
 
 // ─── Event Handlers ──────────────────────────────────────────────
 
-async function onChatCompletionReady(data) {
+async function runBeforeModeSidecar() {
     const settings = getSettings();
     if (!settings.enabled) return;
     if (settings.evalTiming === 'after') return; // After-gen mode — skip pre-gen
+    if (_skipSidecarThisGen) return; // quiet/impersonate generation — not a chat turn
 
     const context = getContext();
     const lastMsg = context.chat?.slice(-1)?.[0];
@@ -486,6 +501,8 @@ async function onMessageReceived(messageId) {
     }
     _pendingSidecarExpression = null;
     _pendingSidecarBackground = null;
+
+    await applyFallbackIfNeeded();
 }
 
 async function applyFallbackIfNeeded() {
@@ -538,6 +555,11 @@ async function restoreFromMetadata() {
 }
 
 // ─── UI Rendering ────────────────────────────────────────────────
+
+const HTML_ESCAPE_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+function escapeHtml(str) {
+    return String(str ?? '').replace(/[&<>"']/g, (c) => HTML_ESCAPE_MAP[c]);
+}
 
 async function fetchSprites() {
     const context = getContext();
@@ -593,12 +615,14 @@ async function renderExpressionGrid() {
         const displayLabel = getDisplayLabel(label);
         const isDisabled = (settings.disabledLabels || []).includes(label);
         const isConditional = conditionalLabels.has(label);
+        const safeLabel = escapeHtml(label);
+        const safeDisplayLabel = escapeHtml(displayLabel);
         return `
-            <div class="bm-sprite-card ${isDisabled ? 'bm-sprite-disabled' : ''}" data-label="${label}" title="${displayLabel}${isDisabled ? ' (disabled)' : ''}">
-                <img class="bm-sprite-thumb" src="${sprite?.path || ''}" alt="${displayLabel}" />
-                <span class="bm-sprite-label bm-editable-label" data-file-label="${label}">${displayLabel}</span>
-                ${!isConditional ? `<button class="bm-sprite-promote" data-file-label="${label}" title="Move to conditionals"><i class="fa-solid fa-arrow-right"></i></button>` : ''}
-                <button class="bm-sprite-toggle" data-file-label="${label}" title="${isDisabled ? 'Enable' : 'Disable'}">
+            <div class="bm-sprite-card ${isDisabled ? 'bm-sprite-disabled' : ''}" data-label="${safeLabel}" title="${safeDisplayLabel}${isDisabled ? ' (disabled)' : ''}">
+                <img class="bm-sprite-thumb" src="${sprite?.path || ''}" alt="${safeDisplayLabel}" />
+                <span class="bm-sprite-label bm-editable-label" data-file-label="${safeLabel}">${safeDisplayLabel}</span>
+                ${!isConditional ? `<button class="bm-sprite-promote" data-file-label="${safeLabel}" title="Move to conditionals"><i class="fa-solid fa-arrow-right"></i></button>` : ''}
+                <button class="bm-sprite-toggle" data-file-label="${safeLabel}" title="${isDisabled ? 'Enable' : 'Disable'}">
                     <i class="fa-solid ${isDisabled ? 'fa-eye-slash' : 'fa-eye'}"></i>
                 </button>
             </div>
@@ -708,10 +732,11 @@ async function renderBgGallery() {
             if (!filename) return '';
             const isConditioned = conditioned.has(filename);
             const thumbPath = `backgrounds/${encodeURIComponent(filename)}`;
+            const safeFilename = escapeHtml(filename);
             return `
-                <div class="bm-bg-card ${isConditioned ? 'bm-bg-conditioned' : ''}" data-filename="${filename}" title="${filename}">
-                    <img class="bm-bg-thumb" src="${thumbPath}" alt="${filename}" loading="lazy" />
-                    <span class="bm-bg-label">${filename}</span>
+                <div class="bm-bg-card ${isConditioned ? 'bm-bg-conditioned' : ''}" data-filename="${safeFilename}" title="${safeFilename}">
+                    <img class="bm-bg-thumb" src="${thumbPath}" alt="${safeFilename}" loading="lazy" />
+                    <span class="bm-bg-label">${safeFilename}</span>
                     ${!isConditioned ? '<button class="bm-bg-add-cond" title="Add conditions"><i class="fa-solid fa-plus"></i></button>' : ''}
                 </div>
             `;
@@ -739,12 +764,13 @@ function renderConditionalBackgrounds() {
         const groups = cb.conditionGroups || [];
         const pillsHtml = buildPillsHtml(groups, false);
         const thumbPath = `backgrounds/${encodeURIComponent(cb.filename || '')}`;
+        const safeFilename = escapeHtml(cb.filename || '');
         return `
             <div class="bm-cond-bg-card" data-bg-index="${i}">
                 <div class="bm-cond-sprite-row">
-                    <img class="bm-cond-sprite-thumb" src="${thumbPath}" alt="${cb.filename || ''}" />
+                    <img class="bm-cond-sprite-thumb" src="${thumbPath}" alt="${safeFilename}" />
                     <div class="bm-cond-sprite-info">
-                        <div class="bm-cond-sprite-label">${cb.filename || '(unnamed)'}</div>
+                        <div class="bm-cond-sprite-label">${cb.filename ? safeFilename : '(unnamed)'}</div>
                         <div class="bm-cond-tags">${pillsHtml}</div>
                     </div>
                     <div class="bm-cond-sprite-actions">
@@ -926,6 +952,7 @@ function bindUIEvents() {
         saveSettings();
         $('#bm_main_controls').toggle(settings.enabled);
         if (settings.enabled) {
+            initActivityFeed();
             suppressClassifier();
             registerSlashCommands();
             if (isGroupChat()) {
@@ -1447,9 +1474,19 @@ jQuery(async () => {
         }
     }
 
-    eventSource.on(event_types.CHAT_COMPLETION_SETTINGS_READY, onChatCompletionReady);
+    eventSource.on(event_types.CHAT_COMPLETION_SETTINGS_READY, runBeforeModeSidecar);
     eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
     eventSource.on(event_types.GENERATION_STOPPED, () => { _sidecarRanForChars.clear(); });
+    // Reset on every new generation (not just after a user message) so before-mode
+    // re-runs on swipes and after-mode runs again on the next turn.
+    eventSource.on(event_types.GENERATION_STARTED, (type, _params, dryRun) => {
+        if (dryRun) return;
+        // Background/utility generations (summarize, image prompts, impersonation)
+        // shouldn't trigger the sidecar or reset the per-turn guard mid-turn.
+        _skipSidecarThisGen = (type === 'quiet' || type === 'impersonate');
+        if (_skipSidecarThisGen) return;
+        _sidecarRanForChars.clear();
+    });
 
     eventSource.on(event_types.CHAT_CHANGED, async () => {
         invalidateCache();
@@ -1470,11 +1507,20 @@ jQuery(async () => {
                 renderConditionalBackgrounds();
             }
             // Delay restore to run after ST's expression moduleWorker clears/resets the sprite
-            setTimeout(() => restoreFromMetadata(), 2500);
+            if (_restoreTimer) clearTimeout(_restoreTimer);
+            _restoreTimer = setTimeout(() => {
+                _restoreTimer = null;
+                restoreFromMetadata();
+            }, 2500);
         }
     });
 
-    eventSource.on(event_types.MESSAGE_SWIPED, restoreFromMetadata);
+    eventSource.on(event_types.MESSAGE_SWIPED, () => {
+        _sidecarRanForChars.clear();
+        restoreFromMetadata();
+    });
+
+    window.addEventListener('beforeunload', restoreClassifier);
 
     console.log(`[${MODULE_NAME}] Extension loaded.`);
 });

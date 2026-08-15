@@ -5,7 +5,7 @@
  */
 
 import { getContext } from '../../../st-context.js';
-import { getSettings } from './index.js';
+import { getSettings, setPendingSidecarResult } from './index.js';
 import { sidecarGenerateWithTools, sidecarGenerate, isSidecarConfigured } from './llm-sidecar.js';
 import { CONDITION_DESCRIPTIONS, formatCondition } from './conditions.js';
 import { getAvailableLabels, fetchBackgroundsList, restoreExpression, applyBackground, getDisplayLabel, saveToMetadata, resolveFileLabel } from './tool.js';
@@ -141,9 +141,15 @@ export async function runSidecar() {
             }
         }
 
-        // Save to the user message that triggered this generation (it exists right now)
-        if (result.expression) saveToMetadata('bunmoji_expression', result.expression);
-        if (result.background) saveToMetadata('bunmoji_background', result.background);
+        // After-mode: the AI message already exists in chat right now, so we can save
+        // straight to its metadata. Before-mode: the AI message doesn't exist yet --
+        // queue the picks so onMessageReceived can attach them once it does.
+        if (settings.evalTiming === 'after') {
+            if (result.expression) saveToMetadata('bunmoji_expression', result.expression);
+            if (result.background) saveToMetadata('bunmoji_background', result.background);
+        } else if (result.expression || result.background) {
+            setPendingSidecarResult(result.expression, result.background);
+        }
 
         if (result.expression) {
             await restoreExpression(result.expression);
@@ -362,14 +368,23 @@ function parseResponse(responseText, spriteLabels, bgFilenames) {
             result.background = fuzzyMatch(bg, bgFilenames);
         }
     } else {
-        // Plain text fallback — scan for known labels
+        // Plain text fallback — scan for known labels. Compare case-insensitively since
+        // spriteLabels holds display labels/aliases which routinely have capitals; keep
+        // a lookup back to the original casing so the returned label still matches
+        // resolveFileLabel's exact-string alias lookup.
+        const lowerToOriginal = new Map(spriteLabels.map(l => [l.toLowerCase(), l]));
         const words = text.toLowerCase().split(/\s+/);
         for (const word of words) {
             const cleaned = word.replace(/[^a-z0-9_-]/g, '');
-            if (spriteLabels.includes(cleaned)) {
-                result.expression = cleaned;
+            if (lowerToOriginal.has(cleaned)) {
+                result.expression = lowerToOriginal.get(cleaned);
                 break;
             }
+        }
+        // Multi-word aliases (e.g. "Happy Grin") can't match the word-by-word scan above —
+        // fall through to fuzzy matching against the full text, same as the JSON branch.
+        if (!result.expression) {
+            result.expression = fuzzyMatch(text, spriteLabels);
         }
     }
 

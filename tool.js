@@ -215,14 +215,23 @@ export function invalidateBgCache() {
 
 // ─── Apply Functions ─────────────────────────────────────────────
 
+// Matches SillyTavern/public/scripts/backgrounds.js BG_METADATA_KEY -- the chat_metadata
+// key holding the currently-locked background url for this chat.
+const BG_METADATA_KEY = 'custom_background';
+
 /**
  * Apply a background by emitting FORCE_SET_BACKGROUND.
+ * No-ops if the target background is already the active one, to avoid piling up
+ * duplicate entries in chat_metadata's background list (ST's handler has no dedup).
  * @param {string} filename - The background filename to set
  */
 export async function applyBackground(filename) {
     if (!filename) return;
+    const url = `url("backgrounds/${encodeURIComponent(filename)}")`;
+    const context = getContext();
+    if (context.chatMetadata?.[BG_METADATA_KEY] === url) return;
     await eventSource.emit(event_types.FORCE_SET_BACKGROUND, {
-        url: `url("backgrounds/${encodeURIComponent(filename)}")`,
+        url,
         path: filename,
     });
 }
